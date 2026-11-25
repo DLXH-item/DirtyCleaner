@@ -784,7 +784,6 @@ namespace DirtyArchiver
                 if (batch.Count >= 300) Flush(soft, batch);
                 if (soft.Truncated) break;
 
-                if (cur.Value >= 24) continue;   // 极深目录保护
                 string[] subs;
                 try { subs = Directory.GetDirectories(dir); }
                 catch { subs = new string[0]; }
@@ -1183,7 +1182,7 @@ namespace DirtyArchiver
     // ---------------------------------------------------------------- 主窗体
     public class MainForm : Form
     {
-        const int MAX_FILES_PER_SOFT = 500000;
+        const int MAX_FILES_PER_SOFT = int.MaxValue;   // 不设文件数上限
 
         string appDir;
         List<string> roots = new List<string>();
@@ -2206,7 +2205,7 @@ namespace DirtyArchiver
             if (currentSoft != null)
             {
                 if (currentSoft.State == 1) state = "（扫描中 " + currentSoft.Files.Count.ToString("N0") + "）";
-                else if (currentSoft.Truncated) state = "（已达 " + MAX_FILES_PER_SOFT.ToString("N0") + " 上限）";
+                else if (currentSoft.Truncated) state = "（扫描被中断）";
             }
             lblStatus.Text = "软件 " + softs.Count.ToString("N0") + " 个  |  " + soft + state +
                 "  |  当前视图 " + viewRecs.Count.ToString("N0") + " 个 / " + Rules.SizeText(viewSize) +
