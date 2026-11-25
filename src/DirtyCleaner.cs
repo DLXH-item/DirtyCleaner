@@ -156,6 +156,8 @@ namespace DirtyArchiver
         public long TotalSize;
         public int State;          // 0 未扫描 1 扫描中 2 完成
         public bool Truncated;
+        public bool OutOfMemory;   // 扫描时内存耗尽，提前结束（已扫到的部分保留）
+        public int DirCount;       // 本次扫描走过的文件夹数
         public string From;        // 来源说明：Registry / Program Files / Local …
 
         public void AddPath(string p)
@@ -732,15 +734,31 @@ namespace DirtyArchiver
     // ---------------------------------------------------------------- 单软件扫描
     static class FileScanner
     {
+        // 内存耗尽时的状态栏文案
+        public static string OomText(Soft s)
+        {
+            return "内存不足，扫描提前结束（已保留 " + s.Files.Count.ToString("N0") + " 文件 / " +
+                   s.DirCount.ToString("N0") + " 文件夹）";
+        }
+
         public static void Scan(Soft soft, int maxFiles, Func<bool> shouldStop)
         {
-            foreach (string root in soft.Paths)
+            try
             {
-                if (shouldStop != null && shouldStop()) return;
-                if (!Directory.Exists(root)) continue;
-                int baseLen = root.TrimEnd('\\').Length + 1;
-                Traverse(root, soft, baseLen, maxFiles, shouldStop);
-                if (soft.Truncated) return;
+                foreach (string root in soft.Paths)
+                {
+                    if (shouldStop != null && shouldStop()) return;
+                    if (!Directory.Exists(root)) continue;
+                    int baseLen = root.TrimEnd('\\').Length + 1;
+                    Traverse(root, soft, baseLen, maxFiles, shouldStop);
+                    if (soft.Truncated) return;
+                }
+            }
+            catch (OutOfMemoryException)
+            {
+                // 内存耗尽不崩程序：已扫到的条目全部保留
+                soft.OutOfMemory = true;
+                soft.Truncated = true;
             }
         }
 
@@ -765,53 +783,77 @@ namespace DirtyArchiver
             List<Rec> batch = new List<Rec>(400);
             int total = soft.Files.Count;
 
-            while (stack.Count > 0)
+            try
             {
-                if (shouldStop != null && shouldStop()) { Flush(soft, batch); return; }
-                KeyValuePair<string, int> cur = stack.Pop();
-                string dir = cur.Key;
-
-                string[] files;
-                try { files = Directory.GetFiles(dir); }
-                catch { files = new string[0]; }
-
-                foreach (string f in files)
+                while (stack.Count > 0)
                 {
-                    if (total + batch.Count >= maxFiles) { soft.Truncated = true; break; }
-                    Rec r = Make(f, soft.Name, baseLen);
-                    if (r != null) batch.Add(r);
-                }
-                if (batch.Count >= 300) Flush(soft, batch);
-                if (soft.Truncated) break;
+                    if (shouldStop != null && shouldStop()) break;
+                    KeyValuePair<string, int> cur = stack.Pop();
+                    string dir = cur.Key;
+                    soft.DirCount++;
 
-                string[] subs;
-                try { subs = Directory.GetDirectories(dir); }
-                catch { subs = new string[0]; }
-                foreach (string s in subs)
-                {
-                    try
+                    string[] files;
+                    try { files = Directory.GetFiles(dir); }
+                    catch (OutOfMemoryException) { throw; }
+                    catch { files = new string[0]; }
+
+                    for (int i = 0; i < files.Length; i++)
                     {
-                        FileAttributes a = File.GetAttributes(s);
-                        if ((a & FileAttributes.ReparsePoint) != 0) continue;
+                        if (total + batch.Count >= maxFiles) { soft.Truncated = true; break; }
+                        Rec r = Make(files[i], soft.Name, baseLen);
+                        if (r != null) batch.Add(r);
                     }
-                    catch { continue; }
-                    stack.Push(new KeyValuePair<string, int>(s, cur.Value + 1));
+                    if (batch.Count >= 300) Flush(soft, batch);
+                    if (soft.Truncated) break;
+
+                    string[] subs;
+                    try { subs = Directory.GetDirectories(dir); }
+                    catch (OutOfMemoryException) { throw; }
+                    catch { subs = new string[0]; }
+                    for (int i = 0; i < subs.Length; i++)
+                    {
+                        try
+                        {
+                            FileAttributes a = File.GetAttributes(subs[i]);
+                            if ((a & FileAttributes.ReparsePoint) != 0) continue;
+                        }
+                        catch (OutOfMemoryException) { throw; }
+                        catch { continue; }
+                        stack.Push(new KeyValuePair<string, int>(subs[i], cur.Value + 1));
+                    }
                 }
             }
-            Flush(soft, batch);
+            catch (OutOfMemoryException)
+            {
+                soft.OutOfMemory = true;
+                soft.Truncated = true;
+            }
+            finally
+            {
+                Flush(soft, batch);   // 已读到的条目尽量落库，内存不足也不会丢已扫部分
+            }
         }
 
         static void Flush(Soft soft, List<Rec> batch)
         {
             if (batch.Count == 0) return;
-            lock (soft.Files)
+            try
             {
-                long add = 0;
-                foreach (Rec r in batch) add += r.SizeBytes;
-                soft.Files.AddRange(batch);
-                soft.TotalSize += add;
+                lock (soft.Files)
+                {
+                    long add = 0;
+                    foreach (Rec r in batch) add += r.SizeBytes;
+                    soft.Files.AddRange(batch);
+                    soft.TotalSize += add;
+                }
+                batch.Clear();
             }
-            batch.Clear();
+            catch (OutOfMemoryException)
+            {
+                soft.OutOfMemory = true;
+                soft.Truncated = true;
+                batch.Clear();   // 释放引用，让 GC 有机会回收
+            }
         }
 
         static Rec Make(string full, string softName, int baseLen)
@@ -832,6 +874,7 @@ namespace DirtyArchiver
                 r.Risk = Rules.Risk(r.Rel, r.Category, r.Ext);
                 return r;
             }
+            catch (OutOfMemoryException) { throw; }
             catch { return null; }
         }
     }
@@ -1916,6 +1959,8 @@ namespace DirtyArchiver
                         target.Files = tmp.Files;
                         target.TotalSize = tmp.TotalSize;
                         target.Truncated = tmp.Truncated;
+                        target.OutOfMemory = tmp.OutOfMemory;
+                        target.DirCount = tmp.DirCount;
                     }
                     // 勾选状态按完整路径迁移，仍存在的文件保持勾选
                     List<string> keep = new List<string>();
@@ -1956,6 +2001,8 @@ namespace DirtyArchiver
             {
                 lock (s.Files) { s.Files.Clear(); s.TotalSize = 0; }
                 s.Truncated = false;
+                s.OutOfMemory = false;
+                s.DirCount = 0;
                 s.State = 0;
             }
             if (s.State != 1)
@@ -1975,12 +2022,26 @@ namespace DirtyArchiver
                 FileScanner.Scan(s, MAX_FILES_PER_SOFT, delegate() { return scanTarget != s; });
                 if (scanTarget == s) s.State = 2;
             }
+            catch (OutOfMemoryException)
+            {
+                s.OutOfMemory = true;
+                s.Truncated = true;
+                s.State = 2;
+            }
             catch { if (scanTarget == s) s.State = 2; }
             this.BeginInvoke(new Action(delegate
             {
-                if (scanTarget == s) s.State = 2;
-                RefreshSoftRow(s);
-                if (currentSoft == s) { RebuildChoices(); RebuildView(true); }
+                try
+                {
+                    if (scanTarget == s) s.State = 2;
+                    RefreshSoftRow(s);
+                    if (currentSoft == s) { RebuildChoices(); RebuildView(true); }
+                }
+                catch (OutOfMemoryException)
+                {
+                    // 内存不足时界面也尽量不崩：保留已有视图内容
+                    lblStatus.Text = FileScanner.OomText(s);
+                }
             }));
         }
 
@@ -1995,11 +2056,22 @@ namespace DirtyArchiver
             tickCount++;
             Soft s = currentSoft;
             if (s == null) return;
+            if (s.State == 1 && s.OutOfMemory)
+            {
+                // 内存耗尽后立即收尾，不再继续增量刷新（避免连续分配）
+                s.State = 2;
+                UpdateStatus();
+                return;
+            }
             if (s.State == 1)
             {
                 lblStatus.Text = "正在扫描 " + s.Name + "：" + s.Files.Count.ToString("N0") + " 个文件 / " +
                                  Rules.SizeText(s.TotalSize);
-                if (tickCount % 3 == 0) { RebuildView(false); RefreshSoftRow(s); }
+                if (tickCount % 3 == 0)
+                {
+                    try { RebuildView(false); RefreshSoftRow(s); }
+                    catch (OutOfMemoryException) { s.OutOfMemory = true; s.Truncated = true; }
+                }
             }
         }
 
@@ -2205,6 +2277,7 @@ namespace DirtyArchiver
             if (currentSoft != null)
             {
                 if (currentSoft.State == 1) state = "（扫描中 " + currentSoft.Files.Count.ToString("N0") + "）";
+                else if (currentSoft.OutOfMemory) state = " · " + FileScanner.OomText(currentSoft);
                 else if (currentSoft.Truncated) state = "（扫描被中断）";
             }
             lblStatus.Text = "软件 " + softs.Count.ToString("N0") + " 个  |  " + soft + state +
@@ -2432,7 +2505,15 @@ namespace DirtyArchiver
                 if (purged != 1 || s2.Files.Count != before - 1) { Console.WriteLine("FAIL purge=" + purged); return 1; }
                 if (s2.TotalSize != 300) { Console.WriteLine("FAIL purge size=" + s2.TotalSize); return 1; }
 
-                Console.WriteLine("SELFTEST OK scan/rules/type/archive/restore/protect/purge");
+                // 内存不足文案：保留已扫到的文件 / 文件夹数
+                Soft oom = new Soft();
+                oom.Name = "OOM";
+                oom.Files.Add(by["app.exe"]);
+                oom.DirCount = 12;
+                string msg = FileScanner.OomText(oom);
+                if (!msg.StartsWith("内存不足，扫描提前结束（已保留 ") || !msg.Contains("1 文件 / 12 文件夹")) { Console.WriteLine("FAIL oom text=" + msg); return 1; }
+
+                Console.WriteLine("SELFTEST OK scan/rules/type/archive/restore/protect/purge/oom");
                 return 0;
             }
             catch (Exception ex)
